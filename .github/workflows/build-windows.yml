@@ -1,0 +1,166 @@
+name: Build Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_tests:
+        description: "运行离线测试 (cargo test --release)"
+        required: false
+        type: boolean
+        default: true
+      create_release:
+        description: "同时发布到 GitHub Release"
+        required: false
+        type: boolean
+        default: false
+      release_tag:
+        description: "Release 标签名（留空默认 build-<run_number>）"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Setup MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Setup BoringSSL dependencies (NASM / Strawberry Perl / LLVM)
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # 1) NASM
+          $nasmDir = 'C:\Program Files\NASM'
+          $nasmCmd = Get-Command nasm -ErrorAction SilentlyContinue
+          if (-not $nasmCmd -and -not (Test-Path -LiteralPath (Join-Path $nasmDir 'nasm.exe'))) {
+            choco install nasm -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "choco install nasm failed ($LASTEXITCODE)" }
+          } elseif ($nasmCmd) {
+            $nasmDir = Split-Path -Parent $nasmCmd.Source
+          }
+          Add-Content -Path $env:GITHUB_PATH -Value $nasmDir
+
+          # 2) Strawberry Perl (must precede MSYS2/Git perl in PATH)
+          $perlBin = 'C:\Strawberry\perl\bin'
+          $perlC = 'C:\Strawberry\c\bin'
+          if (-not (Test-Path -LiteralPath (Join-Path $perlBin 'perl.exe'))) {
+            choco install strawberryperl -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "choco install strawberryperl failed ($LASTEXITCODE)" }
+          }
+          Add-Content -Path $env:GITHUB_PATH -Value $perlBin
+          if (Test-Path -LiteralPath $perlC) {
+            Add-Content -Path $env:GITHUB_PATH -Value $perlC
+          }
+
+          # 3) LLVM / libclang
+          $llvmBin = 'C:\Program Files\LLVM\bin'
+          $libclang = Join-Path $llvmBin 'libclang.dll'
+          if (-not (Test-Path -LiteralPath $libclang)) {
+            choco install llvm -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "choco install llvm failed ($LASTEXITCODE)" }
+          }
+          if (-not (Test-Path -LiteralPath $libclang)) {
+            throw "libclang.dll not found at $libclang"
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value "LIBCLANG_PATH=$llvmBin"
+          Add-Content -Path $env:GITHUB_PATH -Value $llvmBin
+
+      - name: Verify toolchain
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustc -V
+          cargo -V
+          where.exe cl
+          where.exe nasm
+          where.exe perl
+          cmake --version
+          Write-Host "LIBCLANG_PATH=$env:LIBCLANG_PATH"
+          if (-not (Test-Path -LiteralPath (Join-Path $env:LIBCLANG_PATH 'libclang.dll'))) {
+            throw "libclang.dll missing in LIBCLANG_PATH ($env:LIBCLANG_PATH)"
+          }
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run offline tests
+        if: ${{ inputs.run_tests }}
+        run: cargo test --release
+
+      - name: Build Windows release binaries and DLL
+        run: cargo build --release --lib --bin sentinel-rs --bin tls_probe
+
+      - name: Stage and package Windows archive
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = Join-Path $PWD 'dist\stage'
+          $distDir = Join-Path $PWD 'dist'
+          if (Test-Path -LiteralPath $distDir) {
+            Remove-Item -LiteralPath $distDir -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path (Join-Path $stage 'target\release') -Force | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $stage 'webui') -Force | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $stage 'tools') -Force | Out-Null
+
+          $artifacts = @(
+            @{ Src = 'target\release\sentinel-rs.exe'; Dst = 'target\release\sentinel-rs.exe' },
+            @{ Src = 'target\release\sentinel_rs.dll'; Dst = 'target\release\sentinel_rs.dll' },
+            @{ Src = 'target\release\tls_probe.exe';   Dst = 'target\release\tls_probe.exe' },
+            @{ Src = 'webui\app.py';                   Dst = 'webui\app.py' },
+            @{ Src = 'webui\README.md';                Dst = 'webui\README.md' },
+            @{ Src = 'tools\mock_mail.py';             Dst = 'tools\mock_mail.py' },
+            @{ Src = 'sample_challenge.json';          Dst = 'sample_challenge.json' },
+            @{ Src = 'README.md';                      Dst = 'README.md' },
+            @{ Src = '启动-注册.cmd';                   Dst = '启动-注册.cmd' }
+          )
+
+          foreach ($item in $artifacts) {
+            if (-not (Test-Path -LiteralPath $item.Src)) {
+              throw "Missing expected file: $($item.Src)"
+            }
+            Copy-Item -LiteralPath $item.Src -Destination (Join-Path $stage $item.Dst) -Force
+          }
+
+          $zipPath = Join-Path $distDir 'sentinel-rs-windows-x64.zip'
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zipPath -Force
+
+          $hash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $sumFile = Join-Path $distDir 'SHA256SUMS.txt'
+          Set-Content -LiteralPath $sumFile -Value "$hash  sentinel-rs-windows-x64.zip" -Encoding ascii
+          Write-Host "Packaged: $zipPath ($hash)"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sentinel-rs-windows-x64
+          path: |
+            dist/sentinel-rs-windows-x64.zip
+            dist/SHA256SUMS.txt
+          retention-days: 30
+
+      - name: Create GitHub Release
+        if: ${{ inputs.create_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag != '' && inputs.release_tag || format('build-{0}', github.run_number) }}
+          name: ${{ inputs.release_tag != '' && inputs.release_tag || format('build-{0}', github.run_number) }}
+          files: |
+            dist/sentinel-rs-windows-x64.zip
+            dist/SHA256SUMS.txt
